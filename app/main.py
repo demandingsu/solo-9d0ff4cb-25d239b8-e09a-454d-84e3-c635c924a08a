@@ -5,6 +5,10 @@
 两条链齐备才供数并附两条链的登记号与证据号；证据不足标为待补。
 撤回证据时只重核用到它的交接对，撤回与重核在同一事务内一起生效；
 查询接口直接读取已保存的结论。
+
+盘点索引：发布时从同一份已提交数据取出所有交接申请的两端登记号，
+按正在供数的配对连成组；登记号首次入索引时领永久键，每组以最早
+分配的成员键作组键。按登记号或任一已分配键可查当前归属与全组。
 """
 
 from __future__ import annotations
@@ -14,7 +18,8 @@ import os
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
-from .db import Database, DuplicateEvidence, DuplicateHandover
+from .db import Database, DuplicateEvidence, DuplicateHandover, \
+    InventoryConflict
 
 DB_PATH = os.environ.get("HANDOVER_DB", "/data/handover.db")
 
@@ -24,6 +29,7 @@ app = FastAPI(
         "两馆合库后移交标本同件索引的交接服务。证据存入 SQLite，"
         "每条证据含证据号和判为同件的两个登记号；交接对必须找到两条"
         "登记号（除首尾外）与证据均不共用的证据链才供数。"
+        "盘点索引把交接数据编成永久键与分组，支持按登记号或键查询。"
     ),
     version="1.0.0",
 )
@@ -87,6 +93,42 @@ class WithdrawResult(BaseModel):
         description="用到该证据、已在同一事务内完成重核的交接对 id")
     handovers: list[HandoverOut] = Field(
         description="受影响交接对重核后已保存的结论")
+
+
+class InventoryBatchOut(BaseModel):
+    batch_id: int
+    published_at: str
+    handover_count: int = Field(description="本批纳入的交接申请数")
+    supplied_count: int = Field(description="本批正在供数的配对数")
+    member_count: int = Field(description="本批索引成员数")
+    group_count: int = Field(description="本批编出的组数")
+    new_key_count: int = Field(description="本批新分配的永久键数")
+
+
+class InventoryMemberOut(BaseModel):
+    reg: str
+    specimen_key: str
+
+
+class InventoryGroupOut(BaseModel):
+    group_key: str = Field(
+        description="组键：组内最早分配的成员永久键")
+    members: list[InventoryMemberOut]
+
+
+class InventoryListOut(BaseModel):
+    batch: InventoryBatchOut | None = Field(
+        description="当前生效的发布批次（从未发布则为 null）")
+    groups: list[InventoryGroupOut]
+
+
+class InventoryLookupOut(BaseModel):
+    query: str = Field(description="原始查询串（登记号或任一已分配键）")
+    reg: str = Field(description="对应登记号")
+    specimen_key: str = Field(description="该登记号的永久键（永不改派）")
+    group_key: str = Field(description="当前组键")
+    members: list[InventoryMemberOut] = Field(description="当前全组成员")
+    batch: InventoryBatchOut | None = Field(description="本次读取的发布批次")
 
 
 # ----------------------------------------------------------------------
@@ -215,3 +257,49 @@ def reverify_handover(handover_id: int) -> dict:
 @app.get("/health", tags=["系统"], summary="健康检查")
 def health() -> dict:
     return {"status": "ok"}
+
+
+# ----------------------------------------------------------------------
+# 盘点索引接口
+# ----------------------------------------------------------------------
+@app.post(
+    "/inventory/publish",
+    response_model=InventoryBatchOut,
+    tags=["盘点索引"],
+    summary="发布一期盘点索引（取数 -> 核对 -> 键表与索引一起生效）",
+)
+def publish_inventory() -> dict:
+    db = get_db()
+    try:
+        return db.publish_inventory()
+    except InventoryConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"{exc}；查询接口仍返回上期已发布索引",
+        ) from exc
+
+
+@app.get(
+    "/inventory",
+    response_model=InventoryListOut,
+    tags=["盘点索引"],
+    summary="列出当前已发布索引（按组、组内按分配顺序）",
+)
+def list_inventory() -> dict:
+    return get_db().list_inventory()
+
+
+@app.get(
+    "/inventory/{query}",
+    response_model=InventoryLookupOut,
+    tags=["盘点索引"],
+    summary="按登记号或任一已分配键查询当前归属与全组成员",
+)
+def lookup_inventory(query: str) -> dict:
+    result = get_db().lookup_inventory(query)
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"盘点索引中查不到登记号或键：{query}",
+        )
+    return result
